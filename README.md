@@ -1,184 +1,227 @@
-#!/bin/bash
-# =============================================================================
-# export_legal.sh — Export certifié pour réquisition judiciaire (LCEN)
-# =============================================================================
-# Usage :
-#   ./scripts/export_legal.sh --debut 2026-01-01 --fin 2026-01-31
-#
-# Produit :
-#   - Un fichier d'export compressé horodaté
-#   - Un fichier de checksum SHA256 (preuve d'intégrité)
-#   - Un fichier de métadonnées (période, bornes, nombre de lignes)
-# =============================================================================
+# syslog-toolkit
 
-set -euo pipefail
+> Suite d'outils Bash pour la centralisation et l'exploitation des logs syslog — collecte, supervision et export légal (LCEN)
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/../config/config.sh"
+---
 
-# --- Aide --------------------------------------------------------------------
-_usage() {
-  echo "Usage : ./scripts/export_legal.sh --debut YYYY-MM-DD --fin YYYY-MM-DD"
-  echo ""
-  echo "Options :"
-  echo "  --debut <date>   Date de début de la période (incluse)"
-  echo "  --fin   <date>   Date de fin de la période (incluse)"
-  echo "  --help           Afficher cette aide"
-  echo ""
-  echo "Exemple :"
-  echo "  ./scripts/export_legal.sh --debut 2026-01-01 --fin 2026-01-31"
-  exit 0
-}
+## Contexte
 
-# --- Parsing des arguments ---------------------------------------------------
-DATE_DEBUT=""
-DATE_FIN=""
+Ce projet met en place une infrastructure de centralisation des journaux syslog issus d'équipements réseau WiFi (bornes d'accès) et/ou de pare-feu (Sophos).
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --debut) DATE_DEBUT="$2"; shift 2 ;;
-    --fin)   DATE_FIN="$2";   shift 2 ;;
-    --help)  _usage ;;
-    *) echo "[ERREUR] Option inconnue : $1"; _usage ;;
-  esac
-done
+Il supporte la gestion de **plusieurs réseaux distincts** en parallèle — typiquement un réseau WiFi public (visiteurs) et un réseau WiFi interne (agents/employés) — avec des configurations, des dossiers de logs et des rapports séparés pour chaque réseau.
 
-if [[ -z "$DATE_DEBUT" || -z "$DATE_FIN" ]]; then
-  echo "[ERREUR] Les dates de début et de fin sont obligatoires."
-  _usage
-fi
+Conçu pour être déployé sur n'importe quelle infrastructure Linux.
 
-# Validation du format des dates
-date -d "$DATE_DEBUT" '+%Y-%m-%d' > /dev/null 2>&1 || { echo "[ERREUR] Format de date invalide : $DATE_DEBUT"; exit 1; }
-date -d "$DATE_FIN"   '+%Y-%m-%d' > /dev/null 2>&1 || { echo "[ERREUR] Format de date invalide : $DATE_FIN";   exit 1; }
+---
 
-# --- Préparation de l'export -------------------------------------------------
-mkdir -p "$EXPORT_DIR"
+## Prérequis
 
-DATE_DEBUT_COMPACT=$(echo "$DATE_DEBUT" | tr -d '-')
-DATE_FIN_COMPACT=$(echo "$DATE_FIN"     | tr -d '-')
-TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+- Serveur Linux (Debian 12 ou Ubuntu Server 24.04)
+- rsyslog installé et configuré en mode récepteur
+- Droits sudo sur le serveur
+- Bash 5+
 
-NOM_EXPORT="${EXPORT_PREFIX}_${DATE_DEBUT_COMPACT}_${DATE_FIN_COMPACT}"
-DOSSIER_TEMP="/tmp/${NOM_EXPORT}_${TIMESTAMP}"
-FICHIER_EXPORT="$EXPORT_DIR/${NOM_EXPORT}.tar.gz"
-FICHIER_CHECKSUM="$EXPORT_DIR/${NOM_EXPORT}.sha256"
-FICHIER_META="$EXPORT_DIR/${NOM_EXPORT}_metadata.txt"
+---
 
-mkdir -p "$DOSSIER_TEMP"
+## Installation
 
-echo "============================================================"
-echo "  export_legal.sh — Export pour réquisition LCEN"
-echo "  $(date '+%Y-%m-%d %H:%M:%S')"
-echo "============================================================"
-echo ""
-echo "  Période : $DATE_DEBUT → $DATE_FIN"
-echo "  Destination : $EXPORT_DIR/"
-echo ""
+### 1. Cloner le dépôt
 
-# --- Extraction des logs pour la période -------------------------------------
-echo "[INFO] Extraction des logs en cours..."
+```bash
+git clone https://github.com/TON_USERNAME/syslog-toolkit.git
+cd syslog-toolkit
+```
 
-NB_LIGNES_TOTAL=0
-BORNES_PRESENTES=()
+### 2. Créer les fichiers de configuration
 
-# Convertir les dates en format syslog pour le filtrage
-TS_DEBUT=$(date -d "$DATE_DEBUT" +%s)
-TS_FIN=$(date -d "$DATE_FIN 23:59:59" +%s)
+```bash
+# Pour le réseau public
+cp config/config.example.sh config/config.public.sh
+nano config/config.public.sh
 
-for fichier in "$LOG_DIR"/*.log "$LOG_DIR"/*.log*.gz; do
-  [[ -f "$fichier" ]] || continue
+# Pour le réseau interne
+cp config/config.example.sh config/config.interne.sh
+nano config/config.interne.sh
+```
 
-  nom_borne=$(basename "$fichier" | sed 's/\.log.*//')
-  fichier_dest="$DOSSIER_TEMP/${nom_borne}.log"
+### 3. Rendre les scripts exécutables
 
-  # Extraire selon que le fichier est compressé ou non
-  if [[ "$fichier" == *.gz ]]; then
-    contenu=$(zcat "$fichier" 2>/dev/null || true)
-  else
-    contenu=$(cat "$fichier" 2>/dev/null || true)
-  fi
+```bash
+chmod +x scripts/*.sh
+```
 
-  # Filtrer les lignes dans la période
-  lignes_periode=""
-  while IFS= read -r ligne; do
-    # Extraire la date de chaque ligne syslog (format : "Mar 23 14:00:01")
-    ts_ligne=$(echo "$ligne" | awk '{print $1, $2, $3}')
-    ts_epoch=$(date -d "$ts_ligne $(date +%Y)" +%s 2>/dev/null || echo "0")
+### 4. Installer le serveur syslog
 
-    if [[ $ts_epoch -ge $TS_DEBUT && $ts_epoch -le $TS_FIN ]]; then
-      lignes_periode+="$ligne"$'\n'
-    fi
-  done <<< "$contenu"
+```bash
+# Un réseau
+sudo ./scripts/install.sh --reseau public
 
-  if [[ -n "$lignes_periode" ]]; then
-    echo "$lignes_periode" >> "$fichier_dest"
-    nb=$(echo "$lignes_periode" | wc -l)
-    NB_LIGNES_TOTAL=$((NB_LIGNES_TOTAL + nb))
-    BORNES_PRESENTES+=("$nom_borne ($nb lignes)")
-    echo "[OK]   $nom_borne : $nb ligne(s) extraite(s)"
-  fi
-done
+# L'autre réseau
+sudo ./scripts/install.sh --reseau interne
 
-if [[ $NB_LIGNES_TOTAL -eq 0 ]]; then
-  echo "[ATTENTION] Aucun log trouvé pour la période $DATE_DEBUT → $DATE_FIN"
-  rm -rf "$DOSSIER_TEMP"
-  exit 0
-fi
+# Les deux en une commande
+sudo ./scripts/install.sh --reseau all
+```
 
-# --- Génération du fichier de métadonnées ------------------------------------
-cat > "$FICHIER_META" <<EOF
-=============================================================
-  EXPORT LÉGAL — LOGS WIFI PUBLIC
-  Mairie de Rezé — Direction des Systèmes d'Information
-=============================================================
+---
 
-Date d'export      : $(date '+%Y-%m-%d %H:%M:%S')
-Opérateur          : $(whoami)@$(hostname)
-Serveur syslog     : $SYSLOG_IP
+## Configuration
 
-Période couverte   : $DATE_DEBUT → $DATE_FIN
-Lignes exportées   : $NB_LIGNES_TOTAL
+Toutes les variables sont centralisées dans des fichiers de configuration par réseau.  
+Ne jamais commiter ces fichiers — ils sont dans le `.gitignore`.
 
-Bornes concernées :
-$(for b in "${BORNES_PRESENTES[@]}"; do echo "  - $b"; done)
+Voir [`config/config.example.sh`](config/config.example.sh) pour la liste complète des variables.
 
-Base légale        : Loi LCEN art. 6-II / Décret n°2011-219
-Durée de conservation : 1 an
+| Fichier | Réseau |
+|---|---|
+| `config/config.public.sh` | WiFi public (visiteurs) |
+| `config/config.interne.sh` | WiFi interne (agents) |
 
-=============================================================
-NOTE : Le fichier d'export est accompagné d'un checksum
-SHA256 permettant de vérifier son intégrité.
-Pour vérifier : sha256sum -c ${NOM_EXPORT}.sha256
-=============================================================
-EOF
+---
 
-cp "$FICHIER_META" "$DOSSIER_TEMP/metadata.txt"
+## Scripts disponibles
 
-# --- Compression de l'export -------------------------------------------------
-echo ""
-echo "[INFO] Compression de l'export..."
-tar -czf "$FICHIER_EXPORT" -C "/tmp" "${NOM_EXPORT}_${TIMESTAMP}"
-echo "[OK]   Archive créée : $FICHIER_EXPORT"
+Chaque script accepte un paramètre `--reseau [public|interne]` qui détermine sur quel réseau il opère.
 
-# --- Calcul du checksum ------------------------------------------------------
-echo "[INFO] Calcul du checksum SHA256..."
-sha256sum "$FICHIER_EXPORT" > "$FICHIER_CHECKSUM"
-echo "[OK]   Checksum enregistré : $FICHIER_CHECKSUM"
+| Script | Description |
+|---|---|
+| `install.sh` | Installation et configuration du serveur rsyslog |
+| `check_health.sh` | Supervision des bornes (ping + heartbeat) |
+| `search.sh` | Recherche dans les logs par IP, MAC ou date |
+| `export_legal.sh` | Export certifié pour réquisition judiciaire (LCEN) |
+| `anomaly_report.sh` | Rapport quotidien d'anomalies comportementales |
 
-# --- Nettoyage du dossier temporaire -----------------------------------------
-rm -rf "$DOSSIER_TEMP"
+---
 
-# --- Résumé ------------------------------------------------------------------
-echo ""
-echo "============================================================"
-echo "  Export terminé"
-echo "============================================================"
-echo "  Archive        : $FICHIER_EXPORT"
-echo "  Checksum       : $FICHIER_CHECKSUM"
-echo "  Métadonnées    : $FICHIER_META"
-echo "  Lignes totales : $NB_LIGNES_TOTAL"
-echo ""
-echo "  Pour vérifier l'intégrité de l'archive :"
-echo "  sha256sum -c $FICHIER_CHECKSUM"
-echo "============================================================"
+## Détail des scripts
+
+### `install.sh`
+
+Déploie et configure le serveur syslog. Idempotent — peut être relancé sans risque.
+
+```bash
+sudo ./scripts/install.sh --reseau public
+sudo ./scripts/install.sh --reseau interne
+sudo ./scripts/install.sh --reseau all
+```
+
+---
+
+### `check_health.sh`
+
+Vérifie que chaque borne est joignable et envoie ses logs, sans dépendre de l'activité utilisateur.
+
+| Niveau | Mécanisme | Fréquence recommandée |
+|---|---|---|
+| 1 | Ping ICMP | Toutes les 5 minutes |
+| 2 | Heartbeat syslog | Toutes les 6 heures |
+
+```bash
+./scripts/check_health.sh --reseau public
+./scripts/check_health.sh --reseau interne --mode ping
+./scripts/check_health.sh --reseau public --mode heartbeat
+```
+
+Planification via cron :
+
+```bash
+*/5 * * * * /chemin/scripts/check_health.sh --reseau public --mode ping
+*/5 * * * * /chemin/scripts/check_health.sh --reseau interne --mode ping
+0 */6 * * * /chemin/scripts/check_health.sh --reseau public --mode heartbeat
+0 */6 * * * /chemin/scripts/check_health.sh --reseau interne --mode heartbeat
+```
+
+---
+
+### `search.sh`
+
+Recherche dans les logs archivés par IP, MAC ou date.
+
+```bash
+./scripts/search.sh --reseau public --ip 192.168.10.45
+./scripts/search.sh --reseau interne --mac AA:BB:CC:DD:EE:FF
+./scripts/search.sh --reseau public --date 2026-03-15
+./scripts/search.sh --reseau interne --ip 192.168.20.10 --date 2026-03-15 --export
+```
+
+---
+
+### `export_legal.sh`
+
+Génère un export certifié pour une période donnée.  
+Produit une archive compressée + un checksum SHA256 (preuve d'intégrité des logs).
+
+```bash
+./scripts/export_legal.sh --reseau public --debut 2026-01-01 --fin 2026-01-31
+./scripts/export_legal.sh --reseau interne --debut 2026-01-01 --fin 2026-01-31
+```
+
+---
+
+### `anomaly_report.sh`
+
+Analyse les logs de la veille et génère un rapport quotidien d'anomalies comportementales.
+
+```bash
+./scripts/anomaly_report.sh --reseau public
+./scripts/anomaly_report.sh --reseau interne
+```
+
+Planification automatique :
+
+```bash
+0 2 * * * /chemin/scripts/anomaly_report.sh --reseau public
+0 2 * * * /chemin/scripts/anomaly_report.sh --reseau interne
+```
+
+> **Périmètre** : ce script analyse des métadonnées de connexion (MAC, IP, horodatage). Il ne voit pas le contenu des échanges réseau.
+
+---
+
+## Organisation des logs
+
+```
+/var/log/wifi-public/           ← logs bornes WiFi public
+/var/log/wifi-interne/          ← logs bornes WiFi interne
+/var/log/sophos/                ← logs pare-feu Sophos (si source active)
+/var/log/rapports/public/       ← rapports d'anomalies WiFi public
+/var/log/rapports/interne/      ← rapports d'anomalies WiFi interne
+/var/log/exports/public/        ← exports légaux WiFi public
+/var/log/exports/interne/       ← exports légaux WiFi interne
+/var/log/syslog-alerts-public.log
+/var/log/syslog-alerts-interne.log
+```
+
+---
+
+## Structure du dépôt
+
+```
+syslog-toolkit/
+├── README.md
+├── .gitignore
+├── config/
+│   ├── config.example.sh       ← template à copier
+│   ├── config.public.sh        ← config réseau public (non versionné)
+│   └── config.interne.sh       ← config réseau interne (non versionné)
+└── scripts/
+    ├── install.sh
+    ├── check_health.sh
+    ├── search.sh
+    ├── export_legal.sh
+    └── anomaly_report.sh
+```
+
+---
+
+## Conformité légale
+
+- **Loi LCEN** (art. 6-II) — conservation des logs de connexion pendant **1 an** (WiFi public)
+- **Décret n°2011-219** — données à conserver : IP, MAC, horodatage
+- **RGPD** — les logs contiennent des données personnelles — accès restreint aux personnes habilitées
+
+---
+
+## Auteur
+
+Thibaut — Stagiaire DevOps — 2026
